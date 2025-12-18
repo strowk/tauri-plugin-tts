@@ -1,0 +1,13 @@
+"$schema" = "schemas/schema.json"
+
+[default]
+description = "Default permissions for the TTS plugin - allows all text-to-speech operations"
+permissions = [
+    "allow-speak",
+    "allow-stop",
+    "allow-get-voices",
+    "allow-is-speaking",
+    "allow-pause-speaking",
+    "allow-resume-speaking",
+    "allow-preview-voice",
+]

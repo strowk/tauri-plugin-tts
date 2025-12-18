@@ -1,0 +1,36 @@
+[package]
+name = "tauri-plugin-tts"
+version = "0.1.1"
+authors = ["Affex Team"]
+description = "Native text-to-speech plugin for Tauri with multi-language and voice selection"
+edition = "2021"
+rust-version = "1.77.2"
+license = "MIT"
+repository = "https://github.com/brenogonzaga/tauri-plugin-tts"
+homepage = "https://github.com/brenogonzaga/tauri-plugin-tts"
+documentation = "https://docs.rs/tauri-plugin-tts"
+exclude = ["/examples", "/dist-js", "/guest-js", "/node_modules"]
+links = "tauri-plugin-tts"
+keywords = [
+    "tauri",
+    "tts",
+    "text-to-speech",
+    "speech-synthesis",
+    "cross-platform",
+]
+categories = ["multimedia::audio", "api-bindings"]
+
+[dependencies]
+tauri = { version = "2.9.5" }
+serde = "1.0"
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1.0"
+
+# Desktop TTS support
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tts = "0.26"
+
+[build-dependencies]
+tauri-plugin = { version = "2.5.2", features = ["build"] }
