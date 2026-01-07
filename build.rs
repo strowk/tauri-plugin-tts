@@ -3,6 +3,7 @@ const COMMANDS: &[&str] = &[
     "stop",
     "get_voices",
     "is_speaking",
+    "is_initialized",
     "pause_speaking",
     "resume_speaking",
     "preview_voice",

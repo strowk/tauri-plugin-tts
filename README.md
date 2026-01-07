@@ -91,9 +91,9 @@ await speak({ text: "Hello, world!" });
 await speak({
   text: "Olá, mundo!",
   language: "pt-BR",
-  rate: 0.8, // 0.25 to 2.0
-  pitch: 1.2, // 0.5 to 2.0
-  volume: 1.0, // 0.0 to 1.0
+  rate: 0.8, // 0.1 to 4.0 (1.0 = normal)
+  pitch: 1.2, // 0.5 to 2.0 (1.0 = normal)
+  volume: 1.0, // 0.0 to 1.0 (1.0 = full)
 });
 
 // Stop speaking
@@ -201,9 +201,9 @@ Speak the given text.
 - `text` (required): The text to speak
 - `language`: Language/locale code (e.g., "en-US", "pt-BR")
 - `voiceId`: Specific voice ID from `getVoices()` (takes priority over `language`)
-- `rate`: Speech rate (0.25 = quarter, 0.5 = half, 1.0 = normal, 2.0 = double)
-- `pitch`: Voice pitch (0.5 = low, 1.0 = normal, 2.0 = high)
-- `volume`: Volume level (0.0 = silent, 1.0 = full)
+- `rate`: Speech rate (0.1 to 4.0, where 1.0 = normal speed, 2.0 = double, 0.5 = half)
+- `pitch`: Voice pitch (0.5 to 2.0, where 1.0 = normal, 2.0 = high, 0.5 = low)
+- `volume`: Volume level (0.0 to 1.0, where 0.0 = silent, 1.0 = full)
 - `queueMode`: "flush" (default, interrupts current speech) or "add" (queues after current)
 
 ### `stop(): Promise<void>`
@@ -273,6 +273,7 @@ sudo pacman -S speech-dispatcher
 2. Install "Google Text-to-Speech" from Play Store if missing
 3. Download language data for your desired languages
 
+
 ### iOS: Voices sound robotic
 
 **Solution:** Download enhanced voices:
@@ -295,6 +296,19 @@ sudo pacman -S speech-dispatcher
 ## Examples
 
 See the [examples/tts-example](./examples/tts-example) directory for a complete working demo with React + Material UI.
+
+### Building
+
+```bash
+# Build Rust
+cargo build
+
+# Build TypeScript
+npm run build
+
+# Run tests
+cargo test
+```
 
 ## License
 

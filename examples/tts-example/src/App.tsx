@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import {
   Box,
   Button,
@@ -21,12 +21,13 @@ import {
   stop,
   getVoices,
   isSpeaking as guestIsSpeaking,
+  isInitialized,
   type Voice,
 } from "tauri-plugin-tts-api";
 
 export default function App() {
   const [text, setText] = useState(
-    "Hello! This is a test of the text-to-speech plugin."
+    "Hello! This is a test of the text-to-speech plugin. This sentence is longer to ensure we can hear the audio."
   );
   const [selectedVoiceId, setSelectedVoiceId] = useState("");
   const [rate, setRate] = useState(1.0);
@@ -35,24 +36,58 @@ export default function App() {
   const [voices, setVoices] = useState<Voice[]>([]);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [ttsReady, setTtsReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const initCheckRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Load available voices on mount
+  const waitForTtsInit = useCallback(async (): Promise<boolean> => {
+    for (let i = 0; i < 20; i++) {
+      try {
+        const status = await isInitialized();
+        if (status.initialized && status.voiceCount > 0) {
+          setTtsReady(true);
+          return true;
+        }
+      } catch {
+        // TTS not ready yet
+      }
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    return false;
+  }, []);
+
   useEffect(() => {
-    loadVoices();
+    const initAndLoad = async () => {
+      setLoading(true);
+      setError(null);
+
+      // Wait for TTS engine to be ready
+      const ready = await waitForTtsInit();
+      if (!ready) {
+        // Try loading anyway - might work
+        console.warn("TTS init check timed out, attempting to load voices");
+      }
+
+      await loadVoices();
+    };
+
+    initAndLoad();
+
     return () => {
-      // Cleanup polling on unmount
       if (pollingRef.current) {
         clearInterval(pollingRef.current);
       }
+      if (initCheckRef.current) {
+        clearInterval(initCheckRef.current);
+      }
     };
-  }, []);
+  }, [waitForTtsInit]);
 
   // Start polling for speaking status (only when speaking starts)
   const startPolling = () => {
-    if (pollingRef.current) return; // Already polling
+    if (pollingRef.current) return;
 
     setIsSpeaking(true); // Optimistic update
 
@@ -61,7 +96,6 @@ export default function App() {
         const speaking = await guestIsSpeaking();
         setIsSpeaking(speaking);
 
-        // Stop polling when speech ends
         if (!speaking && pollingRef.current) {
           clearInterval(pollingRef.current);
           pollingRef.current = null;
@@ -86,6 +120,11 @@ export default function App() {
     setError(null);
     try {
       const availableVoices = await getVoices();
+      if (availableVoices.length === 0 && !ttsReady) {
+        // TTS might not be initialized yet, retry after a delay
+        setTimeout(loadVoices, 1000);
+        return;
+      }
       setVoices(availableVoices);
       setSuccess(`Loaded ${availableVoices.length} voices`);
       setTimeout(() => setSuccess(null), 3000);
@@ -100,11 +139,13 @@ export default function App() {
     setError(null);
     try {
       await speak({
-        text,
-        voiceId: selectedVoiceId || undefined,
-        rate,
-        pitch,
-        volume,
+          text,
+          voiceId: selectedVoiceId || null,
+          rate,
+          pitch,
+          volume,
+          language: null,
+          queueMode: null
       });
       startPolling(); // Start polling only when speaking starts
       setSuccess("Speaking started!");

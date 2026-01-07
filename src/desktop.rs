@@ -1,132 +1,343 @@
 use serde::de::DeserializeOwned;
-use std::sync::Mutex;
-use tauri::{plugin::PluginApi, AppHandle, Runtime};
-use tts::Tts as TtsEngine;
+use serde::Serialize;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+use tauri::{plugin::PluginApi, AppHandle, Emitter, Runtime};
+use tts::{Features, Tts as TtsEngine};
 
 use crate::models::*;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Default)]
+pub struct SpeechEvent {
+    /// Unique identifier for the utterance (if available)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Event type description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
+}
+
+struct VoiceCache {
+    voices: Vec<Voice>,
+    cached_at: Instant,
+}
+
+impl VoiceCache {
+    const TTL: Duration = Duration::from_secs(60);
+
+    fn new(voices: Vec<Voice>) -> Self {
+        Self {
+            voices,
+            cached_at: Instant::now(),
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        self.cached_at.elapsed() < Self::TTL
+    }
+}
+
+struct EventEmitter<R: Runtime> {
+    app: AppHandle<R>,
+}
+
+impl<R: Runtime> EventEmitter<R> {
+    fn emit(&self, event_name: &str, event: SpeechEvent) {
+        let full_event_name = format!("tts://{}", event_name);
+        if let Err(e) = self.app.emit(&full_event_name, event) {
+            log::warn!("Failed to emit TTS event '{}': {}", event_name, e);
+        }
+    }
+}
+
+/// Normalize user rate (1.0 = normal) to platform-specific rate
+/// Each platform has different rate scales:
+/// - AVFoundation (macOS): 0.1-2.0, normal = 0.5
+/// - WinRT (Windows): 0.5-6.0, normal = 1.0
+/// - SpeechDispatcher (Linux): -100 to 100, normal = 0.0
+/// - AppKit (macOS legacy): 10-500, normal = 175.0
+fn normalize_rate_for_platform(engine: &TtsEngine, user_rate: f32) -> f32 {
+    let normal = engine.normal_rate();
+    let min = engine.min_rate();
+    let max = engine.max_rate();
+
+    // User rate: 1.0 = normal, <1 = slower, >1 = faster
+    // Map user_rate to platform scale using normal_rate as anchor
+    if user_rate <= 1.0 {
+        // Map 0.25-1.0 → min-normal
+        let t = (user_rate - 0.25) / 0.75; // 0.25→0, 1.0→1
+        let t = t.clamp(0.0, 1.0);
+        min + t * (normal - min)
+    } else {
+        // Map 1.0-4.0 → normal-max
+        let t = (user_rate - 1.0) / 3.0; // 1.0→0, 4.0→1
+        let t = t.clamp(0.0, 1.0);
+        normal + t * (max - normal)
+    }
+}
 
 pub fn init<R: Runtime, C: DeserializeOwned>(
     app: &AppHandle<R>,
     _api: PluginApi<R, C>,
 ) -> crate::Result<Tts<R>> {
-    let engine = TtsEngine::default()?;
+    let engine = TtsEngine::default().map_err(|e| {
+        // Provide better error message for Linux when speech-dispatcher is not installed
+        #[cfg(target_os = "linux")]
+        {
+            let err_msg = e.to_string();
+            if err_msg.contains("speech-dispatcher") || err_msg.contains("Speech Dispatcher") {
+                return crate::Error::TtsEngineError(
+                    "Speech Dispatcher not available. Please install it:\n\
+                    Ubuntu/Debian: sudo apt install speech-dispatcher\n\
+                    Fedora: sudo dnf install speech-dispatcher\n\
+                    Arch: sudo pacman -S speech-dispatcher"
+                        .to_string(),
+                );
+            }
+        }
+        crate::Error::from(e)
+    })?;
+
+    // Set up utterance callbacks if supported
+    let Features {
+        utterance_callbacks,
+        ..
+    } = engine.supported_features();
+
+    let emitter = Arc::new(EventEmitter { app: app.clone() });
+
+    if utterance_callbacks {
+        // Clone emitter for each callback
+        let end_emitter = Arc::clone(&emitter);
+        let stop_emitter = Arc::clone(&emitter);
+
+        // Set up on_utterance_end callback (natural completion)
+        if let Err(e) = engine.on_utterance_end(Some(Box::new(move |_utterance_id| {
+            end_emitter.emit(
+                "speech:finish",
+                SpeechEvent {
+                    id: None,
+                    event_type: Some("finish".to_string()),
+                },
+            );
+        }))) {
+            log::warn!("Failed to set on_utterance_end callback: {:?}", e);
+        }
+
+        // Set up on_utterance_stop callback (cancelled/interrupted)
+        if let Err(e) = engine.on_utterance_stop(Some(Box::new(move |_utterance_id| {
+            stop_emitter.emit(
+                "speech:cancel",
+                SpeechEvent {
+                    id: None,
+                    event_type: Some("cancel".to_string()),
+                },
+            );
+        }))) {
+            log::warn!("Failed to set on_utterance_stop callback: {:?}", e);
+        }
+
+        log::info!("TTS utterance callbacks enabled for speech:finish events");
+    } else {
+        log::warn!("TTS engine does not support utterance callbacks - speech:finish events will not be emitted");
+    }
+
     Ok(Tts {
         app: app.clone(),
         engine: Mutex::new(engine),
+        voice_cache: RwLock::new(None),
     })
 }
 
-/// Access to the TTS APIs.
 pub struct Tts<R: Runtime> {
-    #[allow(dead_code)]
     app: AppHandle<R>,
     engine: Mutex<TtsEngine>,
+    voice_cache: RwLock<Option<VoiceCache>>,
 }
 
 impl<R: Runtime> Tts<R> {
-    /// Speak the given text
-    pub fn speak(&self, payload: SpeakRequest) -> crate::Result<SpeakResponse> {
-        let mut engine = self.engine.lock().map_err(|_| crate::Error::LockError)?;
+    /// Helper to acquire engine lock with proper error handling
+    fn with_engine<T, F>(&self, f: F) -> crate::Result<T>
+    where
+        F: FnOnce(&mut TtsEngine) -> crate::Result<T>,
+    {
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| crate::Error::MutexPoisoned)?;
+        f(&mut engine)
+    }
 
-        // Set voice if specified
-        if let Some(ref voice_id) = payload.voice_id {
-            if let Ok(voices) = engine.voices() {
-                if let Some(voice) = voices.into_iter().find(|v| v.id() == *voice_id) {
-                    let _ = engine.set_voice(&voice);
+    fn emit_event(&self, event_name: &str, event: SpeechEvent) {
+        let full_event_name = format!("tts://{}", event_name);
+        if let Err(e) = self.app.emit(&full_event_name, event) {
+            log::warn!("Failed to emit TTS event '{}': {}", event_name, e);
+        }
+    }
+
+    pub fn speak(&self, payload: SpeakRequest) -> crate::Result<SpeakResponse> {
+        // Validate input first (before acquiring lock)
+        let validated = payload.validate()?;
+
+        // Generate utterance ID for tracking
+        let utterance_id = uuid::Uuid::new_v4().to_string();
+
+        // Emit speech:start event
+        self.emit_event(
+            "speech:start",
+            SpeechEvent {
+                id: Some(utterance_id.clone()),
+                event_type: Some("start".to_string()),
+            },
+        );
+
+        let result = self.with_engine(|engine| {
+            // Set voice if specified
+            if let Some(ref voice_id) = validated.voice_id {
+                if let Ok(voices) = engine.voices() {
+                    if let Some(voice) = voices.into_iter().find(|v| v.id() == *voice_id) {
+                        let _ = engine.set_voice(&voice);
+                    }
+                }
+            }
+
+            // WORKAROUND: If all values are default (1.0), do not configure anything
+            // Some engines (especially Google TTS) have bugs when default values are explicitly set
+            let all_defaults =
+                validated.rate == 1.0 && validated.pitch == 1.0 && validated.volume == 1.0;
+
+            if !all_defaults {
+                if validated.rate != 1.0 {
+                    // Normalize user rate (1.0 = normal) to platform-specific scale
+                    // Each platform has different rate ranges and normal values:
+                    // - AVFoundation (macOS): 0.1-2.0, normal = 0.5
+                    // - WinRT (Windows): 0.5-6.0, normal = 1.0
+                    // - SpeechDispatcher (Linux): -100 to 100, normal = 0.0
+                    let rate_to_set = normalize_rate_for_platform(engine, validated.rate);
+                    let _ = engine.set_rate(rate_to_set);
+                }
+
+                if validated.pitch != 1.0 {
+                    // Pitch: tts library uses 0.5-2.0, same as our API (already validated/clamped)
+                    let _ = engine.set_pitch(validated.pitch);
+                }
+
+                if validated.volume != 1.0 {
+                    // Volume: both use 0.0-1.0 (already validated/clamped)
+                    let _ = engine.set_volume(validated.volume);
+                }
+            }
+
+            // Determine if we should interrupt current speech
+            // flush (default) = interrupt, add = queue
+            let interrupt = validated.queue_mode != QueueMode::Add;
+
+            engine.speak(&validated.text, interrupt)?;
+
+            Ok(SpeakResponse {
+                success: true,
+                warning: None,
+            })
+        });
+        result
+    }
+
+    pub fn stop(&self) -> crate::Result<StopResponse> {
+        // Note: speech:cancel is emitted via on_utterance_stop callback set up in init()
+        // for platforms that support it. We still emit here as fallback for legacy backends.
+        self.emit_event(
+            "speech:cancel",
+            SpeechEvent {
+                id: None,
+                event_type: Some("cancel".to_string()),
+            },
+        );
+
+        self.with_engine(|engine| {
+            engine.stop()?;
+            Ok(StopResponse { success: true })
+        })
+    }
+
+    pub fn get_voices(&self, payload: GetVoicesRequest) -> crate::Result<GetVoicesResponse> {
+        // Try to use cached voices first
+        {
+            let cache = self
+                .voice_cache
+                .read()
+                .map_err(|_| crate::Error::MutexPoisoned)?;
+            if let Some(ref c) = *cache {
+                if c.is_valid() {
+                    return Ok(self.filter_voices(&c.voices, &payload.language));
                 }
             }
         }
 
-        // Convert rate from user scale (0.25-2.0 where 1.0 = normal) to TTS library scale
-        // Platform differences:
-        // - macOS (AVFoundation): 0.0-1.0 where 0.5 is normal
-        // - Windows (SAPI): varies by voice, generally 0-10 where 0 is normal
-        // - Linux (speech-dispatcher): -100 to 100 where 0 is normal
-        // The tts library abstracts this, but on macOS it passes through directly
-        #[cfg(target_os = "macos")]
-        let rate_to_set = {
-            // macOS: multiply by 0.5 to map 1.0 -> 0.5
-            let normalized = payload.rate * 0.5;
-            normalized.clamp(0.1, 1.0)
-        };
-        #[cfg(target_os = "windows")]
-        let rate_to_set = {
-            // Windows SAPI: rate is typically -10 to 10, tts lib normalizes to 0.0-1.0
-            // 1.0 user = 0.5 lib (normal)
-            let normalized = payload.rate * 0.5;
-            normalized.clamp(0.1, 1.0)
-        };
-        #[cfg(target_os = "linux")]
-        let rate_to_set = {
-            // Linux speech-dispatcher: tts lib normalizes, similar mapping
-            let normalized = payload.rate * 0.5;
-            normalized.clamp(0.1, 1.0)
-        };
-        let _ = engine.set_rate(rate_to_set);
+        // Cache miss or expired - fetch from engine
+        let voices = self.with_engine(|engine| {
+            let native_voices = engine.voices()?;
+            Ok(native_voices
+                .into_iter()
+                .map(|v| Voice {
+                    id: v.id().to_string(),
+                    name: v.name().to_string(),
+                    language: v.language().to_string(),
+                })
+                .collect::<Vec<Voice>>())
+        })?;
 
-        // Pitch: tts library uses 0.5-2.0, same as our API
-        let _ = engine.set_pitch(payload.pitch);
+        // Update cache
+        {
+            let mut cache = self
+                .voice_cache
+                .write()
+                .map_err(|_| crate::Error::MutexPoisoned)?;
+            *cache = Some(VoiceCache::new(voices.clone()));
+        }
 
-        // Volume: both use 0.0-1.0
-        let _ = engine.set_volume(payload.volume);
-
-        // Determine if we should interrupt current speech
-        // flush (default) = interrupt, add = queue
-        let interrupt = payload.queue_mode != QueueMode::Add;
-
-        // Speak the text
-        engine.speak(&payload.text, interrupt)?;
-
-        Ok(SpeakResponse {
-            success: true,
-            warning: None,
-        })
+        Ok(self.filter_voices(&voices, &payload.language))
     }
 
-    /// Stop any ongoing speech
-    pub fn stop(&self) -> crate::Result<StopResponse> {
-        let mut engine = self.engine.lock().map_err(|_| crate::Error::LockError)?;
-        engine.stop()?;
-        Ok(StopResponse { success: true })
-    }
-
-    /// Get available voices
-    pub fn get_voices(&self, payload: GetVoicesRequest) -> crate::Result<GetVoicesResponse> {
-        let engine = self.engine.lock().map_err(|_| crate::Error::LockError)?;
-        let voices = engine.voices()?;
-
-        let filtered_voices: Vec<Voice> = voices
-            .into_iter()
+    fn filter_voices(&self, voices: &[Voice], language: &Option<String>) -> GetVoicesResponse {
+        let filtered: Vec<Voice> = voices
+            .iter()
             .filter(|v| {
-                if let Some(ref lang_filter) = payload.language {
-                    v.language()
-                        .to_string()
+                if let Some(ref lang_filter) = language {
+                    v.language
                         .to_lowercase()
                         .contains(&lang_filter.to_lowercase())
                 } else {
                     true
                 }
             })
-            .map(|v| Voice {
-                id: v.id().to_string(),
-                name: v.name().to_string(),
-                language: v.language().to_string(),
-            })
+            .cloned()
             .collect();
 
-        Ok(GetVoicesResponse {
-            voices: filtered_voices,
+        GetVoicesResponse { voices: filtered }
+    }
+
+    pub fn is_speaking(&self) -> crate::Result<IsSpeakingResponse> {
+        self.with_engine(|engine| {
+            let speaking = engine.is_speaking()?;
+            Ok(IsSpeakingResponse { speaking })
         })
     }
 
-    /// Check if TTS is currently speaking
-    pub fn is_speaking(&self) -> crate::Result<IsSpeakingResponse> {
-        let engine = self.engine.lock().map_err(|_| crate::Error::LockError)?;
-        let speaking = engine.is_speaking()?;
-        Ok(IsSpeakingResponse { speaking })
+    pub fn is_initialized(&self) -> crate::Result<IsInitializedResponse> {
+        // Desktop TTS is always initialized after construction
+        // Get voice count from cache or fetch
+        let voice_count = self
+            .get_voices(GetVoicesRequest { language: None })
+            .map(|r| r.voices.len() as u32)
+            .unwrap_or(0);
+        Ok(IsInitializedResponse {
+            initialized: true,
+            voice_count,
+        })
     }
 
-    /// Pause the current speech (not supported on desktop)
     pub fn pause_speaking(&self) -> crate::Result<PauseResumeResponse> {
         // Desktop TTS library (tts-rs) doesn't support pause/resume
         // Return a descriptive error
@@ -136,7 +347,6 @@ impl<R: Runtime> Tts<R> {
         })
     }
 
-    /// Resume paused speech (not supported on desktop)
     pub fn resume_speaking(&self) -> crate::Result<PauseResumeResponse> {
         // Desktop TTS library (tts-rs) doesn't support pause/resume
         Ok(PauseResumeResponse {
@@ -145,11 +355,13 @@ impl<R: Runtime> Tts<R> {
         })
     }
 
-    /// Preview a voice with sample text
     pub fn preview_voice(&self, payload: PreviewVoiceRequest) -> crate::Result<SpeakResponse> {
+        // Validate the preview request
+        payload.validate()?;
+
         // Create a speak request with the sample text and specified voice
         let speak_request = SpeakRequest {
-            text: payload.sample_text().to_string(),
+            text: payload.sample_text().into_owned(),
             language: None,
             voice_id: Some(payload.voice_id),
             rate: 1.0,

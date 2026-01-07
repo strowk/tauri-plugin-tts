@@ -307,6 +307,18 @@
           "markdownDescription": "Denies the get_voices command without any pre-configured scope."
         },
         {
+          "description": "Enables the is_initialized command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-is-initialized",
+          "markdownDescription": "Enables the is_initialized command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the is_initialized command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-is-initialized",
+          "markdownDescription": "Denies the is_initialized command without any pre-configured scope."
+        },
+        {
           "description": "Enables the is_speaking command without any pre-configured scope.",
           "type": "string",
           "const": "allow-is-speaking",
@@ -379,10 +391,10 @@
           "markdownDescription": "Denies the stop command without any pre-configured scope."
         },
         {
-          "description": "Default permissions for the TTS plugin - allows all text-to-speech operations\n#### This default permission set includes:\n\n- `allow-speak`\n- `allow-stop`\n- `allow-get-voices`\n- `allow-is-speaking`\n- `allow-pause-speaking`\n- `allow-resume-speaking`\n- `allow-preview-voice`",
+          "description": "Default permissions for the TTS plugin - allows all text-to-speech operations\n#### This default permission set includes:\n\n- `allow-speak`\n- `allow-stop`\n- `allow-get-voices`\n- `allow-is-speaking`\n- `allow-is-initialized`\n- `allow-pause-speaking`\n- `allow-resume-speaking`\n- `allow-preview-voice`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Default permissions for the TTS plugin - allows all text-to-speech operations\n#### This default permission set includes:\n\n- `allow-speak`\n- `allow-stop`\n- `allow-get-voices`\n- `allow-is-speaking`\n- `allow-pause-speaking`\n- `allow-resume-speaking`\n- `allow-preview-voice`"
+          "markdownDescription": "Default permissions for the TTS plugin - allows all text-to-speech operations\n#### This default permission set includes:\n\n- `allow-speak`\n- `allow-stop`\n- `allow-get-voices`\n- `allow-is-speaking`\n- `allow-is-initialized`\n- `allow-pause-speaking`\n- `allow-resume-speaking`\n- `allow-preview-voice`"
         }
       ]
     }

@@ -8,6 +8,7 @@ Default permissions for the TTS plugin - allows all text-to-speech operations
 - `allow-stop`
 - `allow-get-voices`
 - `allow-is-speaking`
+- `allow-is-initialized`
 - `allow-pause-speaking`
 - `allow-resume-speaking`
 - `allow-preview-voice`
@@ -43,6 +44,32 @@ Enables the get_voices command without any pre-configured scope.
 <td>
 
 Denies the get_voices command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`tts:allow-is-initialized`
+
+</td>
+<td>
+
+Enables the is_initialized command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`tts:deny-is-initialized`
+
+</td>
+<td>
+
+Denies the is_initialized command without any pre-configured scope.
 
 </td>
 </tr>

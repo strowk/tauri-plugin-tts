@@ -34,6 +34,12 @@ pub(crate) async fn is_speaking<R: Runtime>(app: AppHandle<R>) -> Result<IsSpeak
     app.tts().is_speaking()
 }
 
+/// Check if TTS engine is initialized and ready
+#[command]
+pub(crate) async fn is_initialized<R: Runtime>(app: AppHandle<R>) -> Result<IsInitializedResponse> {
+    app.tts().is_initialized()
+}
+
 /// Pause the current speech (mobile only, desktop will return error)
 #[command]
 pub(crate) async fn pause_speaking<R: Runtime>(app: AppHandle<R>) -> Result<PauseResumeResponse> {

@@ -1,40 +1,94 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { Voice } from "./bindings/Voice";
+import type { PauseResumeResponse } from "./bindings/PauseResumeResponse";
+import type { SpeakOptions } from "./bindings/SpeakOptions";
+import type {PreviewVoiceOptions} from "./bindings/PreviewVoiceOptions";
 
-/**
- * Queue mode for speech requests
- */
-export type QueueMode = "flush" | "add";
+export type { QueueMode } from "./bindings/QueueMode";
+export type { Voice } from "./bindings/Voice";
+export type { PauseResumeResponse } from "./bindings/PauseResumeResponse";
+export type { SpeakOptions } from "./bindings/SpeakOptions";
+export type { PreviewVoiceOptions } from "./bindings/PreviewVoiceOptions";
 
-/**
- * Options for speaking text
- */
-export interface SpeakOptions {
-  /** The text to speak */
-  text: string;
-  /** The language/locale code (e.g., "en-US", "pt-BR", "ja-JP") */
-  language?: string;
-  /** Specific voice ID to use (from getVoices). Takes priority over language */
-  voiceId?: string;
-  /** Speech rate (0.25 = quarter speed, 0.5 = half speed, 1.0 = normal, 2.0 = double speed) */
-  rate?: number;
-  /** Pitch (0.5 = low, 1.0 = normal, 2.0 = high) */
-  pitch?: number;
-  /** Volume (0.0 = silent, 1.0 = full volume) */
-  volume?: number;
-  /** Queue mode: "flush" (default) stops current speech, "add" queues after current */
-  queueMode?: QueueMode;
+export type TtsErrorCode =
+  | "IO_ERROR"
+  | "PLUGIN_INVOKE_ERROR"
+  | "TTS_ENGINE_ERROR"
+  | "LOCK_ERROR"
+  | "MUTEX_POISONED"
+  | "NOT_INITIALIZED"
+  | "VALIDATION_ERROR"
+  | "OPERATION_FAILED"
+  | "EMPTY_TEXT"
+  | "TEXT_TOO_LONG"
+  | "VOICE_ID_TOO_LONG"
+  | "INVALID_VOICE_ID"
+  | "LANGUAGE_TOO_LONG";
+
+export interface TtsError {
+  /** Error code for programmatic handling */
+  code: TtsErrorCode;
+  /** Human-readable error message */
+  message: string;
 }
 
+export function isTtsError(error: unknown): error is TtsError {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    "message" in error
+  );
+}
+
+export interface SpeechEvent {
+  /** Unique identifier for the utterance (if available) */
+  id?: string;
+  /** Event type description */
+  eventType?: string;
+  /** Error message (for error events) */
+  error?: string;
+  /** Whether speech was interrupted */
+  interrupted?: boolean;
+}
+
+export type SpeechEventType =
+  | "speech:start"
+  | "speech:finish"
+  | "speech:cancel"
+  | "speech:pause"
+  | "speech:resume"
+  | "speech:error"
+  | "speech:interrupted"
+  | "speech:backgroundPause";
+
 /**
- * A voice available on the system
+ * Listen for TTS speech events
+ *
+ * @param eventType - The type of speech event to listen for
+ * @param callback - Function called when the event occurs
+ * @returns Promise that resolves to an unlisten function
+ *
+ * @example
+ * ```typescript
+ * import { onSpeechEvent } from "tauri-plugin-tts-api";
+ *
+ * const unlisten = await onSpeechEvent("speech:finish", (event) => {
+ *   console.log("Speech finished:", event.id);
+ * });
+ *
+ * // Later, stop listening
+ * unlisten();
+ * ```
  */
-export interface Voice {
-  /** Unique identifier for the voice */
-  id: string;
-  /** Display name of the voice */
-  name: string;
-  /** Language code (e.g., "en-US") */
-  language: string;
+export async function onSpeechEvent(
+  eventType: SpeechEventType,
+  callback: (event: SpeechEvent) => void
+): Promise<UnlistenFn> {
+  return listen<SpeechEvent>(`tts://${eventType}`, (event) => {
+    callback(event.payload);
+  });
 }
 
 /**
@@ -42,6 +96,7 @@ export interface Voice {
  *
  * @param options - The speak options including text and optional parameters
  * @returns Promise that resolves when speech has started
+ * @throws TtsError if validation fails or TTS operation fails
  *
  * @example
  * ```typescript
@@ -61,7 +116,7 @@ export interface Voice {
  *
  * // Queue mode - add to queue instead of interrupting
  * await speak({ text: "First sentence" });
- * await speak({ text: "Second sentence", queueMode: "add" }); // Speaks after first finishes
+ * await speak({ text: "Second sentence", queueMode: "add" });
  * ```
  */
 export async function speak(options: SpeakOptions): Promise<void> {
@@ -141,11 +196,41 @@ export async function isSpeaking(): Promise<boolean> {
 }
 
 /**
- * Response for pause/resume operations
+ * Check if TTS engine is initialized and ready
+ *
+ * On mobile platforms, TTS initialization is asynchronous. Use this
+ * to wait for the engine to be ready before calling getVoices().
+ *
+ * @returns Object with initialized status and voice count
+ *
+ * @example
+ * ```typescript
+ * import { isInitialized, getVoices } from "tauri-plugin-tts-api";
+ *
+ * // Wait for TTS to be ready
+ * const waitForTts = async () => {
+ *   for (let i = 0; i < 10; i++) {
+ *     const status = await isInitialized();
+ *     if (status.initialized && status.voiceCount > 0) {
+ *       return true;
+ *     }
+ *     await new Promise(r => setTimeout(r, 500));
+ *   }
+ *   return false;
+ * };
+ *
+ * if (await waitForTts()) {
+ *   const voices = await getVoices();
+ * }
+ * ```
  */
-export interface PauseResumeResponse {
-  success: boolean;
-  reason?: string;
+export async function isInitialized(): Promise<{
+  initialized: boolean;
+  voiceCount: number;
+}> {
+  return invoke<{ initialized: boolean; voiceCount: number }>(
+    "plugin:tts|is_initialized"
+  );
 }
 
 /**
@@ -177,16 +262,6 @@ export async function pauseSpeaking(): Promise<PauseResumeResponse> {
  */
 export async function resumeSpeaking(): Promise<PauseResumeResponse> {
   return await invoke<PauseResumeResponse>("plugin:tts|resume_speaking");
-}
-
-/**
- * Options for previewing a voice
- */
-export interface PreviewVoiceOptions {
-  /** The voice ID to preview (from getVoices) */
-  voiceId: string;
-  /** Optional custom text for preview (defaults to a sample sentence) */
-  text?: string;
 }
 
 /**

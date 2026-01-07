@@ -6,7 +6,7 @@ Complete demonstration of the `tauri-plugin-tts` functionality using React + Typ
 
 - ✅ Basic text-to-speech with customizable text
 - ✅ Voice selection with language grouping
-- ✅ Rate control (0.25x - 2.0x)
+- ✅ Rate control (0.1x - 4.0x)
 - ✅ Pitch control (0.5 - 2.0)
 - ✅ Volume control (0% - 100%)
 - ✅ Real-time speaking status polling

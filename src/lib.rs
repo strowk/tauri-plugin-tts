@@ -32,7 +32,6 @@ impl<R: Runtime, T: Manager<R>> crate::TtsExt<R> for T {
     }
 }
 
-/// Initializes the plugin.
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
     Builder::new("tts")
         .invoke_handler(tauri::generate_handler![
@@ -40,6 +39,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::stop,
             commands::get_voices,
             commands::is_speaking,
+            commands::is_initialized,
             commands::pause_speaking,
             commands::resume_speaking,
             commands::preview_voice

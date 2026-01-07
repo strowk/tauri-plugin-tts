@@ -4,6 +4,75 @@ import Tauri
 import UIKit
 import WebKit
 
+/// Maximum text length in bytes (10KB)
+private let maxTextLength = 10_000
+/// Maximum voice ID length
+private let maxVoiceIdLength = 256
+/// Maximum language code length
+private let maxLanguageLength = 35
+/// Allowed characters in voice ID (alphanumeric, dots, underscores, hyphens)
+private let voiceIdAllowedCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+
+enum TtsValidationError: Error, LocalizedError {
+    case emptyText
+    case textTooLong(length: Int, max: Int)
+    case voiceIdTooLong(length: Int, max: Int)
+    case invalidVoiceIdFormat
+    case languageTooLong(length: Int, max: Int)
+    
+    var errorDescription: String? {
+        switch self {
+        case .emptyText:
+            return "Text cannot be empty"
+        case .textTooLong(let length, let max):
+            return "Text too long: \(length) characters (max: \(max))"
+        case .voiceIdTooLong(let length, let max):
+            return "Voice ID too long: \(length) characters (max: \(max))"
+        case .invalidVoiceIdFormat:
+            return "Invalid voice ID format - only alphanumeric, dots, underscores, and hyphens allowed"
+        case .languageTooLong(let length, let max):
+            return "Language code too long: \(length) characters (max: \(max))"
+        }
+    }
+    
+    var errorCode: String {
+        switch self {
+        case .emptyText: return "EMPTY_TEXT"
+        case .textTooLong: return "TEXT_TOO_LONG"
+        case .voiceIdTooLong: return "VOICE_ID_TOO_LONG"
+        case .invalidVoiceIdFormat: return "INVALID_VOICE_ID"
+        case .languageTooLong: return "LANGUAGE_TOO_LONG"
+        }
+    }
+}
+
+private struct InputValidator {
+    static func validateText(_ text: String) throws {
+        if text.isEmpty {
+            throw TtsValidationError.emptyText
+        }
+        if text.count > maxTextLength {
+            throw TtsValidationError.textTooLong(length: text.count, max: maxTextLength)
+        }
+    }
+    
+    static func validateVoiceId(_ voiceId: String) throws {
+        if voiceId.count > maxVoiceIdLength {
+            throw TtsValidationError.voiceIdTooLong(length: voiceId.count, max: maxVoiceIdLength)
+        }
+        // Check if voice ID contains only allowed characters
+        if voiceId.unicodeScalars.contains(where: { !voiceIdAllowedCharacters.contains($0) }) {
+            throw TtsValidationError.invalidVoiceIdFormat
+        }
+    }
+    
+    static func validateLanguage(_ language: String) throws {
+        if language.count > maxLanguageLength {
+            throw TtsValidationError.languageTooLong(length: language.count, max: maxLanguageLength)
+        }
+    }
+}
+
 class SpeakArgs: Decodable {
     let text: String
     let language: String?
@@ -11,7 +80,32 @@ class SpeakArgs: Decodable {
     let rate: Float?
     let pitch: Float?
     let volume: Float?
-    let queueMode: String? // "flush" (default) or "add"
+    let queueMode: String?
+    
+    func validate() throws {
+        try InputValidator.validateText(text)
+        if let voiceId = voiceId {
+            try InputValidator.validateVoiceId(voiceId)
+        }
+        if let language = language {
+            try InputValidator.validateLanguage(language)
+        }
+    }
+    
+    var clampedRate: Float {
+        guard let rate = rate else { return 1.0 }
+        return min(max(rate, 0.1), 4.0)
+    }
+    
+    var clampedPitch: Float {
+        guard let pitch = pitch else { return 1.0 }
+        return min(max(pitch, 0.5), 2.0)
+    }
+    
+    var clampedVolume: Float {
+        guard let volume = volume else { return 1.0 }
+        return min(max(volume, 0.0), 1.0)
+    }
 }
 
 class GetVoicesArgs: Decodable {
@@ -22,9 +116,17 @@ class PreviewVoiceArgs: Decodable {
     let voiceId: String
     let text: String?
     
-    /// Returns the sample text or a default preview message
+    static let defaultSampleText = "Hello! This is a sample of how this voice sounds."
+    
     var sampleText: String {
-        return text ?? "Hello! This is a sample of how this voice sounds."
+        return text ?? Self.defaultSampleText
+    }
+    
+    func validate() throws {
+        try InputValidator.validateVoiceId(voiceId)
+        if let text = text {
+            try InputValidator.validateText(text)
+        }
     }
 }
 
@@ -32,10 +134,12 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
     private let synthesizer = AVSpeechSynthesizer()
     private var currentUtteranceId: String?
     private var wasInterrupted: Bool = false
-    
-    override init() {
+    private var isInForeground: Bool = true
+    private var voiceCache: [AVSpeechSynthesisVoice]?
+    private var voiceCacheTimestamp: Date?
+    private let voiceCacheTTL: TimeInterval = 60.0
+        override init() {
         super.init()
-        NSLog("[TtsPlugin] ============================================")
         NSLog("[TtsPlugin] PLUGIN INIT")
         NSLog("[TtsPlugin]   iOS Version: \(UIDevice.current.systemVersion)")
         NSLog("[TtsPlugin]   Device: \(UIDevice.current.model)")
@@ -43,10 +147,9 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
         NSLog("[TtsPlugin]   Synthesizer delegate set")
         setupAudioSession()
         setupInterruptionHandling()
-        NSLog("[TtsPlugin] ============================================")
+        setupLifecycleObservers()
     }
     
-    /// Configure audio session for speech synthesis
     private func setupAudioSession() {
         NSLog("[TtsPlugin] setupAudioSession() CALLED")
         do {
@@ -60,7 +163,57 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
         }
     }
     
-    /// Setup observers for audio session interruptions (phone calls, Siri, etc.)
+    private func setupLifecycleObservers() {
+        NSLog("[TtsPlugin] setupLifecycleObservers() CALLED")
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAppDidEnterBackground),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
+        
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAppWillEnterForeground),
+            name: UIApplication.willEnterForegroundNotification,
+            object: nil
+        )
+        
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAppWillTerminate),
+            name: UIApplication.willTerminateNotification,
+            object: nil
+        )
+        NSLog("[TtsPlugin]   Lifecycle observers registered")
+    }
+    
+    @objc private func handleAppDidEnterBackground() {
+        NSLog("[TtsPlugin] App entered background")
+        isInForeground = false
+        
+        // Pause speech when entering background (unless background audio is enabled)
+        if synthesizer.isSpeaking && !synthesizer.isPaused {
+            synthesizer.pauseSpeaking(at: .word)
+            NSLog("[TtsPlugin]   Speech paused due to background transition")
+            trigger("speech:backgroundPause", data: JSObject())
+        }
+    }
+    
+    @objc private func handleAppWillEnterForeground() {
+        NSLog("[TtsPlugin] App will enter foreground")
+        isInForeground = true
+        
+        // Optionally resume paused speech
+        // Note: We don't auto-resume to avoid unexpected audio
+    }
+    
+    @objc private func handleAppWillTerminate() {
+        NSLog("[TtsPlugin] App will terminate - cleaning up")
+        synthesizer.stopSpeaking(at: .immediate)
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+    
     private func setupInterruptionHandling() {
         NSLog("[TtsPlugin] setupInterruptionHandling() CALLED")
         NotificationCenter.default.addObserver(
@@ -79,7 +232,6 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
         NSLog("[TtsPlugin]   Observers registered")
     }
     
-    /// Handles audio route changes (headphones plugged/unplugged, Bluetooth, etc.)
     @objc private func handleAudioRouteChange(notification: Notification) {
         guard let userInfo = notification.userInfo,
               let reasonValue = userInfo[AVAudioSessionRouteChangeReasonKey] as? UInt,
@@ -102,7 +254,6 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
         }
     }
     
-    /// Handle audio interruptions such as phone calls
     @objc private func handleAudioSessionInterruption(notification: Notification) {
         guard let userInfo = notification.userInfo,
               let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
@@ -147,8 +298,6 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
         NotificationCenter.default.removeObserver(self)
     }
     
-    // MARK: - AVSpeechSynthesizerDelegate
-    
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
         var event = JSObject()
         if let id = currentUtteranceId {
@@ -189,22 +338,28 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
         trigger("speech:resume", data: JSObject())
     }
     
-    // MARK: - Commands
-    
     @objc public func speak(_ invoke: Invoke) throws {
-        NSLog("[TtsPlugin] ============================================")
         NSLog("[TtsPlugin] speak() CALLED")
         
         let args = try invoke.parseArgs(SpeakArgs.self)
+        
+        do {
+            try args.validate()
+        } catch let error as TtsValidationError {
+            NSLog("[TtsPlugin]   Validation error: \(error.localizedDescription)")
+            invoke.reject("\(error.errorCode): \(error.localizedDescription)")
+            return
+        }
+        
         NSLog("[TtsPlugin]   Text length: \(args.text.count) chars")
         NSLog("[TtsPlugin]   Language: \(args.language ?? "default")")
         NSLog("[TtsPlugin]   VoiceId: \(args.voiceId ?? "default")")
-        NSLog("[TtsPlugin]   Rate: \(args.rate ?? 1.0)")
-        NSLog("[TtsPlugin]   Pitch: \(args.pitch ?? 1.0)")
-        NSLog("[TtsPlugin]   Volume: \(args.volume ?? 1.0)")
+        NSLog("[TtsPlugin]   Rate: \(args.clampedRate)")
+        NSLog("[TtsPlugin]   Pitch: \(args.clampedPitch)")
+        NSLog("[TtsPlugin]   Volume: \(args.clampedVolume)")
         NSLog("[TtsPlugin]   QueueMode: \(args.queueMode ?? "flush")")
+        NSLog("[TtsPlugin]   Foreground: \(isInForeground)")
         
-        // Ensure audio session is active
         setupAudioSession()
         
         // Handle queue mode: "flush" (default) stops current speech, "add" queues it
@@ -216,7 +371,6 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
         
         let utterance = AVSpeechUtterance(string: args.text)
         
-        // Generate utterance ID for tracking
         currentUtteranceId = UUID().uuidString
         
         var warning: String? = nil
@@ -237,17 +391,23 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
             }
         }
         
-        if let rate = args.rate {
-            let normalizedRate = rate * 0.5
-            utterance.rate = min(max(normalizedRate, AVSpeechUtteranceMinimumSpeechRate), AVSpeechUtteranceMaximumSpeechRate)
-        }
+        // WORKAROUND: If all values are default (1.0), skip configuration
+        // Allow the engine to use the system's default values
+        let allDefaults = (args.clampedRate == 1.0 && args.clampedPitch == 1.0 && args.clampedVolume == 1.0)
         
-        if let pitch = args.pitch {
-            utterance.pitchMultiplier = min(max(pitch, 0.5), 2.0)
-        }
-        
-        if let volume = args.volume {
-            utterance.volume = min(max(volume, 0.0), 1.0)
+        if !allDefaults {
+            if args.clampedRate != 1.0 {
+                let normalizedRate = args.clampedRate * 0.5
+                utterance.rate = min(max(normalizedRate, AVSpeechUtteranceMinimumSpeechRate), AVSpeechUtteranceMaximumSpeechRate)
+            }
+            
+            if args.clampedPitch != 1.0 {
+                utterance.pitchMultiplier = args.clampedPitch
+            }
+            
+            if args.clampedVolume != 1.0 {
+                utterance.volume = args.clampedVolume
+            }
         }
         
         synthesizer.speak(utterance)
@@ -263,7 +423,6 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
     }
     
     @objc public func stop(_ invoke: Invoke) throws {
-        NSLog("[TtsPlugin] ============================================")
         NSLog("[TtsPlugin] stop() CALLED")
         NSLog("[TtsPlugin]   isSpeaking: \(synthesizer.isSpeaking)")
         synthesizer.stopSpeaking(at: .immediate)
@@ -304,7 +463,24 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
         NSLog("[TtsPlugin] getVoices() CALLED")
         
         let args = try invoke.parseArgs(GetVoicesArgs.self)
-        let allVoices = AVSpeechSynthesisVoice.speechVoices()
+        
+        // Check cache first
+        let now = Date()
+        let isCacheValid = voiceCache != nil && 
+                          voiceCacheTimestamp != nil && 
+                          now.timeIntervalSince(voiceCacheTimestamp!) < voiceCacheTTL
+        
+        let allVoices: [AVSpeechSynthesisVoice]
+        if isCacheValid {
+            allVoices = voiceCache!
+            NSLog("[TtsPlugin]   Using cached voices (age: \(Int(now.timeIntervalSince(voiceCacheTimestamp!)))s)")
+        } else {
+            allVoices = AVSpeechSynthesisVoice.speechVoices()
+            voiceCache = allVoices
+            voiceCacheTimestamp = now
+            NSLog("[TtsPlugin]   Refreshed voice cache")
+        }
+        
         NSLog("[TtsPlugin]   Total available voices: \(allVoices.count)")
         NSLog("[TtsPlugin]   Language filter: \(args.language ?? "none")")
         
@@ -330,24 +506,41 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
     @objc public func isSpeaking(_ invoke: Invoke) throws {
         NSLog("[TtsPlugin] isSpeaking() CALLED")
         NSLog("[TtsPlugin]   Speaking: \(synthesizer.isSpeaking), Paused: \(synthesizer.isPaused)")
+        // Only return "speaking" field for consistency with Desktop and Android
+        // The paused state can be inferred from pauseSpeaking/resumeSpeaking API
         invoke.resolve([
-            "speaking": synthesizer.isSpeaking,
-            "paused": synthesizer.isPaused
+            "speaking": synthesizer.isSpeaking
+        ])
+    }
+    
+    @objc public func isInitialized(_ invoke: Invoke) throws {
+        NSLog("[TtsPlugin] isInitialized() CALLED")
+        // iOS AVSpeechSynthesizer is always ready - no async init needed
+        let voices = AVSpeechSynthesisVoice.speechVoices()
+        invoke.resolve([
+            "initialized": true,
+            "voiceCount": voices.count
         ])
     }
     
     @objc public func previewVoice(_ invoke: Invoke) throws {
-        NSLog("[TtsPlugin] ============================================")
         NSLog("[TtsPlugin] previewVoice() CALLED")
         
         let args = try invoke.parseArgs(PreviewVoiceArgs.self)
+        
+        do {
+            try args.validate()
+        } catch let error as TtsValidationError {
+            NSLog("[TtsPlugin]   Validation error: \(error.localizedDescription)")
+            invoke.reject("\(error.errorCode): \(error.localizedDescription)")
+            return
+        }
+        
         NSLog("[TtsPlugin]   VoiceId: \(args.voiceId)")
         NSLog("[TtsPlugin]   Sample text: \(args.sampleText)")
         
-        // Ensure audio session is active
         setupAudioSession()
         
-        // Stop any current speech
         if synthesizer.isSpeaking {
             NSLog("[TtsPlugin]   Stopping current speech")
             synthesizer.stopSpeaking(at: .immediate)
@@ -356,7 +549,6 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
         let utterance = AVSpeechUtterance(string: args.sampleText)
         currentUtteranceId = UUID().uuidString
         
-        // Set the voice to preview
         if let voice = AVSpeechSynthesisVoice.speechVoices().first(where: { $0.identifier == args.voiceId }) {
             utterance.voice = voice
             NSLog("[TtsPlugin]   Voice found: \(voice.name)")
@@ -366,7 +558,6 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
             return
         }
         
-        // Use default settings for preview
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
         utterance.pitchMultiplier = 1.0
         utterance.volume = 1.0

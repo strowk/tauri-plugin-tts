@@ -9,7 +9,6 @@ use crate::models::*;
 #[cfg(target_os = "ios")]
 tauri::ios_plugin_binding!(init_plugin_tts);
 
-// initializes the Kotlin or Swift plugin classes
 pub fn init<R: Runtime, C: DeserializeOwned>(
     _app: &AppHandle<R>,
     api: PluginApi<R, C>,
@@ -21,7 +20,6 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
     Ok(Tts(handle))
 }
 
-/// Access to the TTS APIs.
 pub struct Tts<R: Runtime>(PluginHandle<R>);
 
 impl<R: Runtime> Tts<R> {
@@ -32,9 +30,7 @@ impl<R: Runtime> Tts<R> {
     }
 
     pub fn stop(&self) -> crate::Result<StopResponse> {
-        self.0
-            .run_mobile_plugin("stop", StopRequest {})
-            .map_err(Into::into)
+        self.0.run_mobile_plugin("stop", ()).map_err(Into::into)
     }
 
     pub fn get_voices(&self, payload: GetVoicesRequest) -> crate::Result<GetVoicesResponse> {
@@ -45,7 +41,13 @@ impl<R: Runtime> Tts<R> {
 
     pub fn is_speaking(&self) -> crate::Result<IsSpeakingResponse> {
         self.0
-            .run_mobile_plugin("isSpeaking", IsSpeakingRequest {})
+            .run_mobile_plugin("isSpeaking", ())
+            .map_err(Into::into)
+    }
+
+    pub fn is_initialized(&self) -> crate::Result<IsInitializedResponse> {
+        self.0
+            .run_mobile_plugin("isInitialized", ())
             .map_err(Into::into)
     }
 
